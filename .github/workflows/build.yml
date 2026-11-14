@@ -1,0 +1,120 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Leer version
+        id: v
+        run: |
+          VER=$(tr -d ' \r\n' < version.txt 2>/dev/null || true)
+          [ -z "$VER" ] && VER=1.0
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "Version $VER, build ${{ github.run_number }}"
+
+      - name: Crear proyecto Android con Capacitor
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/app@7 @capacitor/local-notifications@7 @capacitor/filesystem@7 @capacitor/share@7
+          npx cap init "Súper Michi" com.supermichi.app --web-dir www
+          npx cap add android
+
+      - name: Icono de la app
+        if: hashFiles('icon.png') != ''
+        continue-on-error: true
+        run: |
+          mkdir -p assets
+          cp icon.png assets/icon.png
+          npx --yes @capacitor/assets generate --android --iconBackgroundColor '#00b386' --iconBackgroundColorDark '#00b386'
+
+      - name: Permisos, notificaciones y version
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>#' "$MANIFEST"
+          mkdir -p android/app/src/main/res/drawable
+          cat > android/app/src/main/res/drawable/ic_stat_michi.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd"
+                  android:pathData="M3.2 9.4L4.2 2.2L9.4 5.6Q12 5 14.6 5.6L19.8 2.2L20.8 9.4Q22.4 11.6 22.4 14.4Q22.4 20.6 12 20.6Q1.6 20.6 1.6 14.4Q1.6 11.6 3.2 9.4zM7 12.4a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0zM14 12.4a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0zM10.8 15.6L13.2 15.6L12 17z"/>
+          </vector>
+          EOF
+          node -e "const fs=require('fs');const f='capacitor.config.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));c.plugins={...(c.plugins||{}),LocalNotifications:{smallIcon:'ic_stat_michi',iconColor:'#00B386'}};fs.writeFileSync(f,JSON.stringify(c,null,2));"
+          sed -i -E "s/versionCode [0-9]+/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"${{ steps.v.outputs.ver }}\"/" android/app/build.gradle
+          sed -i -E 's/targetSdkVersion *= *[0-9]+/targetSdkVersion = 34/' android/variables.gradle
+
+      - name: Llave de firma fija
+        run: |
+          if gh release download signing-key --pattern michi.keystore --dir . 2>/dev/null; then
+            echo "Llave de firma reutilizada"
+          else
+            keytool -genkeypair -keystore michi.keystore -alias michi -keyalg RSA -keysize 2048 -validity 36500 -storepass michi2024 -keypass michi2024 -dname "CN=Super Michi, O=Super Michi, C=BO"
+            gh release create signing-key michi.keystore --prerelease --title "Llave de firma (no borrar)" --notes "Mantiene la firma fija para actualizar la app sin desinstalarla. No borres este release." || gh release upload signing-key michi.keystore --clobber
+          fi
+          cat >> android/app/build.gradle <<'EOF'
+
+          android {
+              signingConfigs {
+                  michi {
+                      storeFile file("../../michi.keystore")
+                      storePassword "michi2024"
+                      keyAlias "michi"
+                      keyPassword "michi2024"
+                  }
+              }
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.michi
+                  }
+              }
+          }
+          EOF
+
+      - name: Compilar APK
+        run: |
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Publicar APK en Releases
+        run: |
+          VER="${{ steps.v.outputs.ver }}"
+          TAG="v$VER"
+          APK="SuperMichi-$VER.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "$APK"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" --title "Súper Michi $VER" --notes "APK compilada automaticamente (build ${{ github.run_number }})."
+          fi
