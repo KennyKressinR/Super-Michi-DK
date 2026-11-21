@@ -73,6 +73,507 @@ jobs:
           sed -i -E "s/versionCode [0-9]+/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"${{ steps.v.outputs.ver }}\"/" android/app/build.gradle
           sed -i -E 's/targetSdkVersion *= *[0-9]+/targetSdkVersion = 34/' android/variables.gradle
 
+      - name: Alarmas nativas (plugin propio de Android)
+        continue-on-error: true
+        run: |
+          D=android/app/src/main/java/com/supermichi/app
+          M=android/app/src/main/AndroidManifest.xml
+          cp "$M" AndroidManifest.base.xml
+          cp "$D/MainActivity.java" MainActivity.java.base
+          rollback() { rm -f "$D"/Michi*.java; cp MainActivity.java.base "$D/MainActivity.java"; cp AndroidManifest.base.xml "$M"; echo "::warning::No se pudo preparar el plugin de alarmas; se usaran solo notificaciones"; }
+          trap 'rollback' ERR
+          cat > "$D/MichiSched.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class MichiSched {
+              static final String PREFS = "michi_alarms";
+
+              static PendingIntent firePi(Context c, int id, String title, String body, boolean alarm) {
+                  Intent i = new Intent(c, MichiReceiver.class);
+                  i.setAction("com.supermichi.app.FIRE");
+                  i.putExtra("id", id);
+                  i.putExtra("title", title);
+                  i.putExtra("body", body);
+                  i.putExtra("alarm", alarm);
+                  return PendingIntent.getBroadcast(c, id, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              static void schedule(Context c, int id, long at, String title, String body, boolean alarm) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  if (am == null) return;
+                  PendingIntent op = firePi(c, id, title, body, alarm);
+                  boolean exact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms();
+                  try {
+                      if (exact && alarm) {
+                          Intent li = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+                          if (li == null) li = new Intent(c, MichiAlarmActivity.class);
+                          PendingIntent show = PendingIntent.getActivity(c, 0, li, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                          am.setAlarmClock(new AlarmManager.AlarmClockInfo(at, show), op);
+                      } else if (exact) {
+                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, op);
+                      } else {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, op);
+                      }
+                  } catch (SecurityException e) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, op);
+                  }
+              }
+
+              static void cancel(Context c, int id) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  if (am == null) return;
+                  am.cancel(firePi(c, id, "", "", false));
+              }
+
+              static void saveSet(Context c, JSONArray items) {
+                  c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("items", items.toString()).apply();
+              }
+
+              static JSONArray loadSet(Context c) {
+                  try {
+                      return new JSONArray(c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("items", "[]"));
+                  } catch (Exception e) {
+                      return new JSONArray();
+                  }
+              }
+
+              static void rescheduleAll(Context c) {
+                  JSONArray a = loadSet(c);
+                  long now = System.currentTimeMillis();
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o == null) continue;
+                      long at = o.optLong("at");
+                      if (at > now) schedule(c, o.optInt("id"), at, o.optString("title"), o.optString("body"), o.optBoolean("alarm"));
+                  }
+              }
+          }
+          EOF
+          cat > "$D/MichiReceiver.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.AudioAttributes;
+          import android.media.AudioManager;
+          import android.media.RingtoneManager;
+          import android.os.Build;
+          import android.provider.Settings;
+          import androidx.core.app.NotificationCompat;
+
+          public class MichiReceiver extends BroadcastReceiver {
+              static final String CH_N = "michi_eventos";
+              static final String CH_A = "michi_alarma";
+              static final String A_STOP = "com.supermichi.app.STOP";
+              static final String A_SNOOZE = "com.supermichi.app.SNOOZE";
+
+              static void channels(Context c) {
+                  if (Build.VERSION.SDK_INT < 26) return;
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  NotificationChannel n = new NotificationChannel(CH_N, "Eventos", NotificationManager.IMPORTANCE_HIGH);
+                  n.setDescription("Avisos de tu agenda");
+                  nm.createNotificationChannel(n);
+                  NotificationChannel a = new NotificationChannel(CH_A, "Alarmas", NotificationManager.IMPORTANCE_HIGH);
+                  a.setDescription("Alarmas de tu agenda");
+                  a.enableVibration(true);
+                  a.setVibrationPattern(new long[]{0, 800, 400, 800, 400, 800});
+                  a.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  AudioAttributes attrs = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ALARM)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+                  a.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM), attrs);
+                  nm.createNotificationChannel(a);
+              }
+
+              static PendingIntent action(Context c, int id, String action, String title, String body) {
+                  Intent i = new Intent(c, MichiReceiver.class);
+                  i.setAction(action);
+                  i.putExtra("id", id);
+                  i.putExtra("title", title);
+                  i.putExtra("body", body);
+                  int code = id + (A_STOP.equals(action) ? 200000 : 300000);
+                  return PendingIntent.getBroadcast(c, code, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              @Override
+              public void onReceive(Context c, Intent in) {
+                  String act = in.getAction();
+                  int id = in.getIntExtra("id", 0);
+                  String title = in.getStringExtra("title");
+                  String body = in.getStringExtra("body");
+                  if (title == null) title = "S\u00faper Michi";
+                  if (body == null) body = "";
+                  boolean alarm = in.getBooleanExtra("alarm", false);
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  if (A_STOP.equals(act)) {
+                      nm.cancel(id);
+                      return;
+                  }
+                  if (A_SNOOZE.equals(act)) {
+                      nm.cancel(id);
+                      MichiSched.schedule(c, id, System.currentTimeMillis() + 10 * 60 * 1000L, title, body, true);
+                      return;
+                  }
+                  channels(c);
+                  Intent open = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+                  if (open == null) open = new Intent();
+                  PendingIntent openPi = PendingIntent.getActivity(c, id, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  int icon = c.getResources().getIdentifier("ic_stat_michi", "drawable", c.getPackageName());
+                  if (icon == 0) icon = android.R.drawable.ic_dialog_info;
+                  NotificationCompat.Builder b = new NotificationCompat.Builder(c, alarm ? CH_A : CH_N)
+                          .setSmallIcon(icon)
+                          .setContentTitle(title)
+                          .setContentText(body)
+                          .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
+                          .setContentIntent(openPi)
+                          .setAutoCancel(!alarm)
+                          .setColor(0xFF00B386)
+                          .setPriority(alarm ? NotificationCompat.PRIORITY_MAX : NotificationCompat.PRIORITY_HIGH);
+                  Intent ai = null;
+                  if (alarm) {
+                      ai = new Intent(c, MichiAlarmActivity.class);
+                      ai.putExtra("id", id);
+                      ai.putExtra("title", title);
+                      ai.putExtra("body", body);
+                      ai.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                      PendingIntent full = PendingIntent.getActivity(c, id + 100000, ai, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                      b.setCategory(NotificationCompat.CATEGORY_ALARM)
+                              .setOngoing(true)
+                              .setFullScreenIntent(full, true)
+                              .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM), AudioManager.STREAM_ALARM)
+                              .setVibrate(new long[]{0, 800, 400, 800, 400, 800})
+                              .addAction(0, "Detener", action(c, id, A_STOP, title, body))
+                              .addAction(0, "Posponer 10 min", action(c, id, A_SNOOZE, title, body));
+                  }
+                  Notification n = b.build();
+                  if (alarm) n.flags |= Notification.FLAG_INSISTENT;
+                  nm.notify(id, n);
+                  if (alarm && ai != null && Settings.canDrawOverlays(c)) {
+                      try {
+                          c.startActivity(ai);
+                      } catch (Exception e) {
+                          // si Android lo bloquea, queda la notificacion de pantalla completa
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > "$D/MichiAlarmActivity.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.app.Activity;
+          import android.app.NotificationManager;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MichiAlarmActivity extends Activity {
+              private int id;
+              private String title;
+              private String body;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true);
+                      setTurnScreenOn(true);
+                  }
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                          | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+                          | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                          | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+                  id = getIntent().getIntExtra("id", 0);
+                  title = getIntent().getStringExtra("title");
+                  body = getIntent().getStringExtra("body");
+                  if (title == null) title = "Alarma";
+                  if (body == null) body = "";
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setPadding(64, 64, 64, 64);
+                  root.setBackgroundColor(Color.parseColor("#0B2B24"));
+
+                  TextView t = new TextView(this);
+                  t.setText(title);
+                  t.setTextSize(30);
+                  t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setTextColor(Color.WHITE);
+                  t.setGravity(Gravity.CENTER);
+                  root.addView(t, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  TextView d = new TextView(this);
+                  d.setText(body);
+                  d.setTextSize(18);
+                  d.setTextColor(Color.parseColor("#BFE9DC"));
+                  d.setGravity(Gravity.CENTER);
+                  LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  dp.topMargin = 32;
+                  dp.bottomMargin = 64;
+                  root.addView(d, dp);
+
+                  Button stop = new Button(this);
+                  stop.setText("Detener");
+                  stop.setTextSize(20);
+                  stop.setOnClickListener(v -> {
+                      dismissNotification();
+                      finish();
+                  });
+                  root.addView(stop, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 180));
+
+                  Button snooze = new Button(this);
+                  snooze.setText("Posponer 10 minutos");
+                  snooze.setTextSize(18);
+                  snooze.setOnClickListener(v -> {
+                      dismissNotification();
+                      MichiSched.schedule(this, id, System.currentTimeMillis() + 10 * 60 * 1000L, title, body, true);
+                      finish();
+                  });
+                  LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 150);
+                  sp.topMargin = 32;
+                  root.addView(snooze, sp);
+
+                  setContentView(root);
+              }
+
+              private void dismissNotification() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm != null) nm.cancel(id);
+              }
+          }
+          EOF
+          cat > "$D/MichiBootReceiver.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class MichiBootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  MichiSched.rescheduleAll(c);
+              }
+          }
+          EOF
+          cat > "$D/MichiAlarmPlugin.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.app.AlarmManager;
+          import android.app.NotificationManager;
+          import android.content.ContentResolver;
+          import android.content.ContentUris;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.os.PowerManager;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          @CapacitorPlugin(name = "MichiAlarm")
+          public class MichiAlarmPlugin extends Plugin {
+
+              @PluginMethod
+              public void sync(PluginCall call) {
+                  Context c = getContext();
+                  try {
+                      JSONArray old = MichiSched.loadSet(c);
+                      for (int i = 0; i < old.length(); i++) {
+                          JSONObject o = old.optJSONObject(i);
+                          if (o != null) MichiSched.cancel(c, o.optInt("id"));
+                      }
+                      JSArray items = call.getArray("items");
+                      JSONArray keep = new JSONArray();
+                      long now = System.currentTimeMillis();
+                      if (items != null) {
+                          for (int i = 0; i < items.length(); i++) {
+                              JSONObject o = items.getJSONObject(i);
+                              long at = o.optLong("at");
+                              if (at <= now) continue;
+                              MichiSched.schedule(c, o.optInt("id"), at, o.optString("title"), o.optString("body"), o.optBoolean("alarm"));
+                              keep.put(o);
+                          }
+                      }
+                      MichiSched.saveSet(c, keep);
+                      JSObject r = new JSObject();
+                      r.put("count", keep.length());
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              @PluginMethod
+              public void status(PluginCall call) {
+                  Context c = getContext();
+                  JSObject r = new JSObject();
+                  r.put("sdk", Build.VERSION.SDK_INT);
+                  r.put("overlay", Settings.canDrawOverlays(c));
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  r.put("exact", Build.VERSION.SDK_INT < 31 || (am != null && am.canScheduleExactAlarms()));
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  r.put("fullscreen", Build.VERSION.SDK_INT < 34 || (nm != null && nm.canUseFullScreenIntent()));
+                  PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                  r.put("battery", pm != null && pm.isIgnoringBatteryOptimizations(c.getPackageName()));
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void openSettings(PluginCall call) {
+                  String w = call.getString("w", "app");
+                  Context c = getContext();
+                  Uri u = Uri.parse("package:" + c.getPackageName());
+                  try {
+                      Intent i;
+                      if ("overlay".equals(w)) {
+                          i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, u);
+                      } else if ("exact".equals(w) && Build.VERSION.SDK_INT >= 31) {
+                          i = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, u);
+                      } else if ("fullscreen".equals(w) && Build.VERSION.SDK_INT >= 34) {
+                          i = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, u);
+                      } else if ("battery".equals(w)) {
+                          i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, u);
+                      } else {
+                          i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, u);
+                      }
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      c.startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      try {
+                          Intent d = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, u);
+                          d.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          c.startActivity(d);
+                          call.resolve();
+                      } catch (Exception e2) {
+                          call.reject("No se pudo abrir el ajuste");
+                      }
+                  }
+              }
+
+              @PluginMethod
+              public void saveFile(PluginCall call) {
+                  String name = call.getString("name", "respaldo.json");
+                  String data = call.getString("data", "");
+                  JSObject r = new JSObject();
+                  if (Build.VERSION.SDK_INT < 29) {
+                      r.put("ok", false);
+                      call.resolve(r);
+                      return;
+                  }
+                  try {
+                      ContentResolver cr = getContext().getContentResolver();
+                      String rel = Environment.DIRECTORY_DOWNLOADS + "/SuperMichi/";
+                      Uri uri = null;
+                      Cursor q = cr.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                              new String[]{MediaStore.Downloads._ID},
+                              MediaStore.Downloads.DISPLAY_NAME + "=? AND " + MediaStore.Downloads.RELATIVE_PATH + "=?",
+                              new String[]{name, rel}, null);
+                      if (q != null) {
+                          if (q.moveToFirst()) uri = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, q.getLong(0));
+                          q.close();
+                      }
+                      if (uri == null) {
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                          v.put(MediaStore.Downloads.MIME_TYPE, "application/json");
+                          v.put(MediaStore.Downloads.RELATIVE_PATH, rel);
+                          uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                      }
+                      OutputStream os = uri == null ? null : cr.openOutputStream(uri, "wt");
+                      if (os == null) {
+                          r.put("ok", false);
+                          call.resolve(r);
+                          return;
+                      }
+                      os.write(data.getBytes(StandardCharsets.UTF_8));
+                      os.close();
+                      r.put("ok", true);
+                      r.put("path", "Descargas/SuperMichi/" + name);
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      r.put("ok", false);
+                      r.put("error", String.valueOf(e.getMessage()));
+                      call.resolve(r);
+                  }
+              }
+          }
+          EOF
+          cat > "$D/MainActivity.java" <<'EOF'
+          package com.supermichi.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MichiAlarmPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          EOF
+          cat > patch-manifest.js <<'EOF'
+          const fs = require('fs');
+          const f = 'android/app/src/main/AndroidManifest.xml';
+          let s = fs.readFileSync(f, 'utf8');
+          const perms = ['SYSTEM_ALERT_WINDOW', 'USE_FULL_SCREEN_INTENT', 'SCHEDULE_EXACT_ALARM', 'USE_EXACT_ALARM', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
+            .map(p => '    <uses-permission android:name="android.permission.' + p + '" />').join('\n');
+          const comps = [
+            '    <receiver android:name=".MichiReceiver" android:exported="false" />',
+            '    <receiver android:name=".MichiBootReceiver" android:exported="true">',
+            '        <intent-filter>',
+            '            <action android:name="android.intent.action.BOOT_COMPLETED" />',
+            '            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />',
+            '        </intent-filter>',
+            '    </receiver>',
+            '    <activity android:name=".MichiAlarmActivity" android:exported="false" android:showWhenLocked="true" android:turnScreenOn="true" android:excludeFromRecents="true" android:launchMode="singleInstance" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />'
+          ].join('\n');
+          s = s.replace('</application>', comps + '\n    </application>').replace('</manifest>', perms + '\n</manifest>');
+          fs.writeFileSync(f, s);
+          EOF
+          node patch-manifest.js
+          echo "Plugin de alarmas preparado"
+
       - name: Llave de firma fija
         run: |
           if gh release download signing-key --pattern michi.keystore --dir . 2>/dev/null; then
@@ -105,7 +606,17 @@ jobs:
           npx cap sync android
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          if ! ./gradlew assembleDebug --no-daemon; then
+            echo "::warning::Fallo la compilacion con alarmas nativas. Compilando sin ellas (solo notificaciones)."
+            cd ..
+            D=android/app/src/main/java/com/supermichi/app
+            rm -f "$D"/Michi*.java
+            [ -f MainActivity.java.base ] && cp MainActivity.java.base "$D/MainActivity.java"
+            [ -f AndroidManifest.base.xml ] && cp AndroidManifest.base.xml android/app/src/main/AndroidManifest.xml
+            echo "NOALARM=1" >> "$GITHUB_ENV"
+            cd android
+            ./gradlew assembleDebug --no-daemon
+          fi
 
       - name: Publicar APK en Releases
         run: |
@@ -116,5 +627,7 @@ jobs:
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" "$APK" --clobber
           else
-            gh release create "$TAG" "$APK" --title "Súper Michi $VER" --notes "APK compilada automaticamente (build ${{ github.run_number }})."
+            NOTE=""
+            [ "$NOALARM" = "1" ] && NOTE=" Esta APK se compilo SIN alarmas nativas, revisa el log."
+            gh release create "$TAG" "$APK" --title "Súper Michi $VER" --notes "APK compilada automaticamente (build ${{ github.run_number }}).$NOTE"
           fi
