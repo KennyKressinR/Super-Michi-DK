@@ -70,7 +70,8 @@ jobs:
           </vector>
           EOF
           node -e "const fs=require('fs');const f='capacitor.config.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));c.plugins={...(c.plugins||{}),LocalNotifications:{smallIcon:'ic_stat_michi',iconColor:'#00B386'}};fs.writeFileSync(f,JSON.stringify(c,null,2));"
-          sed -i -E "s/versionCode [0-9]+/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"${{ steps.v.outputs.ver }}\"/" android/app/build.gradle
+          VC=$(( $(date +%s) / 60 ))
+          sed -i -E "s/versionCode [0-9]+/versionCode $VC/; s/versionName \"[^\"]*\"/versionName \"${{ steps.v.outputs.ver }}\"/" android/app/build.gradle
           sed -i -E 's/targetSdkVersion *= *[0-9]+/targetSdkVersion = 34/' android/variables.gradle
 
       - name: Alarmas nativas (plugin propio de Android)
@@ -577,10 +578,61 @@ jobs:
       - name: Llave de firma fija
         run: |
           if gh release download signing-key --pattern michi.keystore --dir . 2>/dev/null; then
-            echo "Llave de firma reutilizada"
+            echo "Llave de firma: la del release signing-key (la misma de siempre)"
           else
-            keytool -genkeypair -keystore michi.keystore -alias michi -keyalg RSA -keysize 2048 -validity 36500 -storepass michi2024 -keypass michi2024 -dname "CN=Super Michi, O=Super Michi, C=BO"
-            gh release create signing-key michi.keystore --prerelease --title "Llave de firma (no borrar)" --notes "Mantiene la firma fija para actualizar la app sin desinstalarla. No borres este release." || gh release upload signing-key michi.keystore --clobber
+            sed 's/[[:space:]]//g' <<'B64' | base64 -d > michi.keystore
+          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
+          B64
+            if keytool -list -keystore michi.keystore -storepass michi2024 > /dev/null 2>&1; then
+              echo "Llave de firma: la llave fija incluida en este archivo"
+            else
+              echo "::warning::No se pudo leer la llave incluida. Creando una nueva y guardandola en el release signing-key."
+              rm -f michi.keystore
+              keytool -genkeypair -keystore michi.keystore -alias michi -keyalg RSA -keysize 2048 -validity 36500 -storepass michi2024 -keypass michi2024 -dname "CN=Super Michi, O=Super Michi, C=BO"
+              gh release create signing-key michi.keystore --prerelease --title "Llave de firma (no borrar)" --notes "Mantiene la firma fija para actualizar la app sin desinstalarla. No borres este release." || gh release upload signing-key michi.keystore --clobber
+            fi
           fi
           cat >> android/app/build.gradle <<'EOF'
 
@@ -618,6 +670,15 @@ jobs:
             ./gradlew assembleDebug --no-daemon
           fi
 
+      - name: Verificar firma
+        continue-on-error: true
+        run: |
+          AS=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          FP=$("$AS" verify --print-certs android/app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256 digest" | head -1 | sed 's/.*: //')
+          echo "FIRMA=$FP" >> "$GITHUB_ENV"
+          if [ "${FP^^}" = "184DF49971FC6FDDCAD846BCBF85E686553722B34F5C936E1034AF5158F1FF9D" ]; then MSG="Firma fija confirmada"; else MSG="Firma del release signing-key (distinta a la incluida)"; fi
+          echo "$MSG. SHA-256: $FP" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Publicar APK en Releases
         run: |
           VER="${{ steps.v.outputs.ver }}"
@@ -629,5 +690,5 @@ jobs:
           else
             NOTE=""
             [ "$NOALARM" = "1" ] && NOTE=" Esta APK se compilo SIN alarmas nativas, revisa el log."
-            gh release create "$TAG" "$APK" --title "Súper Michi $VER" --notes "APK compilada automaticamente (build ${{ github.run_number }}).$NOTE"
+            gh release create "$TAG" "$APK" --title "Súper Michi $VER" --notes "APK compilada automaticamente (build ${{ github.run_number }}). Firma SHA-256: $FIRMA.$NOTE"
           fi
